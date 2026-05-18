@@ -1,0 +1,19 @@
+### Cursor / IDE
+.DS_Store
+.idea/
+.vscode/
+
+### 运行时与缓存
+runtime/
+assets/cache/
+runtime.log
+*.log
+
+### 安装锁(由 ACG-FAKA 安装流程生成)
+kernel/Install/Lock
+
+### 助手添加: 含真实支付凭据, 不入库; 改用 Config.example.php 作为模板
+/app/Pay/Epay/Config/Config.php
+
+### 自助修改的部署相关备份
+*.bak.*

@@ -1,5 +1,6 @@
 #{include file="./Header.html"}
 <main class="container py-4">
+  #{if $config.notice}
   <!-- 公告面板 -->
   <div class="panel">
     <div class="panel-header">
@@ -10,6 +11,7 @@
         #{$config.notice}
     </div>
   </div>
+  #{/if}
 
   <!-- 购买面板 -->
   <div class="panel">
