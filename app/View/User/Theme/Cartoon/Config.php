@@ -59,7 +59,16 @@ interface Config
         "EMAIL" => "User/Email.html", //会员-邮箱
         "PHONE" => "User/Phone.html", //会员-手机
         "PASSWORD" => "User/Password.html", //会员-密码设置
+        "TWO_FACTOR" => "User/TwoFactor.html", //会员-两步验证
+        "PASSKEY" => "User/Passkey.html", //会员-通行密钥
+        "DEVICE" => "User/Device.html", //会员-登录设备
+        "IP_WHITELIST" => "User/IpWhitelist.html", //会员-对接白名单
+        "SECURITY_LOG" => "User/SecurityLog.html", //会员-安全日志
         "ORDER" => "User/Order.html", //会员-密码设置
+        "TICKET" => "User/Ticket.html", //会员-我的工单
+        "TICKET_CREATE" => "User/TicketCreate.html", //会员-创建工单
+        "TICKET_DETAIL" => "User/TicketDetail.html", //会员-工单详情
+        "MESSAGE" => "User/Message.html", //会员-消息中心
         "AGENT_MEMBER" => "Agent/Member.html", //推广代理-我的下级
     ];
 

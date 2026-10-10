@@ -5,14 +5,15 @@ namespace App\Controller\Admin\Api;
 
 
 use App\Controller\Base\API\Manage;
-use App\Entity\Query\Delete;
 use App\Entity\Query\Get;
-use App\Entity\Query\Save;
 use App\Interceptor\ManageSession;
 use App\Model\ManageLog;
 use App\Service\Query;
+use App\Util\CardFile\Purge;
 use App\Util\Date;
 use App\Util\Ini;
+use App\Util\Schema;
+use Illuminate\Database\Capsule\Manager as DB;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Relations\Relation;
 use Kernel\Annotation\Inject;
@@ -20,12 +21,217 @@ use Kernel\Annotation\Interceptor;
 use Kernel\Context\Interface\Request;
 use Kernel\Exception\JSONException;
 use Kernel\Waf\Filter;
+use Kernel\Waf\Firewall;
 
 #[Interceptor(ManageSession::class, Interceptor::TYPE_API)]
 class Card extends Manage
 {
     #[Inject]
     private Query $query;
+
+    private const MAX_BATCH_COUNT = 500;
+    private const MAX_EXPORT_COUNT = 5000;
+
+    /**
+     * @param mixed $value
+     * @return int[]
+     */
+    private function cardIds(mixed $value): array
+    {
+        if (is_string($value)) {
+            $value = explode(',', $value);
+        }
+        if (!is_array($value)) {
+            $value = [$value];
+        }
+
+        $ids = [];
+        foreach ($value as $candidate) {
+            if (is_int($candidate)) {
+                $id = $candidate;
+            } elseif (is_string($candidate) && ctype_digit(trim($candidate))) {
+                $id = (int)trim($candidate);
+            } else {
+                throw new JSONException('卡密 ID 必须是正整数');
+            }
+            if ($id <= 0) {
+                throw new JSONException('卡密 ID 必须是正整数');
+            }
+            $ids[] = $id;
+        }
+        $ids = array_values(array_unique($ids));
+        if (count($ids) > self::MAX_BATCH_COUNT) {
+            throw new JSONException('单次最多操作 ' . self::MAX_BATCH_COUNT . ' 张卡密');
+        }
+        return $ids;
+    }
+
+    /**
+     * @param int[] $requestedIds
+     * @param bool $lock
+     * @return array
+     * @throws JSONException
+     */
+    private function cardDeleteImpact(array $requestedIds, bool $lock = false): array
+    {
+        if ($requestedIds === []) {
+            throw new JSONException('你还没有选择卡密');
+        }
+        $query = \App\Model\Card::query()
+            ->whereIn('id', $requestedIds)
+            ->orderBy('id')
+            ->select(['id', 'status', 'order_id']);
+        if ($lock) {
+            $query->lockForUpdate();
+        }
+        $cards = $query->get();
+        if ($cards->count() !== count($requestedIds)) {
+            throw new JSONException('部分卡密不存在，请刷新后重试');
+        }
+        $ids = $cards->pluck('id')->map(static fn($id): int => (int)$id)->all();
+        if ($ids === []) {
+            throw new JSONException('所选卡密不存在');
+        }
+        $soldCount = $cards->filter(static fn($card): bool => (int)$card->status === 1)->count();
+        $lockedCount = $cards->filter(static fn($card): bool => (int)$card->status === 2)->count();
+        $linkedCount = $cards->filter(static fn($card): bool => (int)$card->order_id > 0)->count();
+        $orderReferenceQuery = \App\Model\Order::query()
+            ->whereIn('card_id', $ids)
+            ->orderBy('id');
+        if ($lock) {
+            $orderReferenceQuery->lockForUpdate();
+        }
+        $orderReferences = $orderReferenceQuery->get(['id', 'card_id', 'status']);
+        $activeReferences = $orderReferences->filter(
+            static fn($order): bool => (int)$order->status !== 1
+        );
+        $paidReferences = $orderReferences->filter(
+            static fn($order): bool => (int)$order->status === 1
+        );
+        $reservedCardIds = $activeReferences
+            ->pluck('card_id')
+            ->map(static fn($id): int => (int)$id)
+            ->unique()
+            ->values()
+            ->all();
+        $reservedLookup = array_fill_keys($reservedCardIds, true);
+        $deletableIds = array_values(array_filter(
+            $ids,
+            static fn(int $id): bool => !isset($reservedLookup[$id])
+        ));
+
+        return [
+            'card_ids' => $ids,
+            'deletable_ids' => $deletableIds,
+            'card_count' => count($ids),
+            'deletable_count' => count($deletableIds),
+            'blocked_count' => count($reservedCardIds),
+            'sold_count' => $soldCount,
+            'locked_count' => $lockedCount,
+            'linked_count' => $linkedCount,
+            'order_reference_count' => $orderReferences->count(),
+            'active_order_reference_count' => $activeReferences->count(),
+            'paid_order_reference_count' => $paidReferences->count(),
+            'can_delete' => $reservedCardIds === [],
+        ];
+    }
+
+    /**
+     * Build a strict, export-only filter query. Exact or fuzzy card secrets stay
+     * in the POST body and never enter the URL or browser history.
+     *
+     * @param array $raw
+     * @return array{0:Builder,1:bool}
+     * @throws JSONException
+     */
+    private function cardExportQuery(array $raw): array
+    {
+        $raw = \App\Util\SearchFilter::decode($raw);
+        $query = \App\Model\Card::query();
+        $hasFilter = false;
+        $stringFilters = [
+            'equal-secret' => ['secret', '='],
+            'search-secret' => ['secret', 'like'],
+            'equal-note' => ['note', '='],
+            'equal-race' => ['race', '='],
+        ];
+        foreach ($stringFilters as $key => [$column, $operator]) {
+            $value = trim((string)($raw[$key] ?? ''));
+            if ($value === '') {
+                continue;
+            }
+            $hasFilter = true;
+            $query->where($column, $operator, $operator === 'like' ? '%' . $value . '%' : $value);
+        }
+
+        foreach (['equal-owner' => 'owner', 'equal-commodity_id' => 'commodity_id', 'equal-status' => 'status'] as $key => $column) {
+            $value = $raw[$key] ?? '';
+            if ($value === '' || $value === null) {
+                continue;
+            }
+            $integer = filter_var($value, FILTER_VALIDATE_INT);
+            if ($integer === false || $integer < 0 || ($column === 'status' && !in_array($integer, [0, 1, 2], true))) {
+                throw new JSONException('卡密导出筛选条件不正确');
+            }
+            $hasFilter = true;
+            $query->where($column, $integer);
+        }
+
+        foreach (['betweenStart-create_time' => '>=', 'betweenEnd-create_time' => '<='] as $key => $operator) {
+            $value = trim((string)($raw[$key] ?? ''));
+            if ($value === '') {
+                continue;
+            }
+            if (strtotime($value) === false) {
+                throw new JSONException('卡密入库时间筛选不正确');
+            }
+            $hasFilter = true;
+            $query->where('create_time', $operator, $value);
+        }
+
+        foreach ($raw as $key => $value) {
+            if (!str_starts_with((string)$key, 'equal-sku-') || $value === '' || $value === null) {
+                continue;
+            }
+            $skuKey = substr((string)$key, strlen('equal-sku-'));
+            if (!\App\Util\Sku::isValidKey($skuKey)) {
+                throw new JSONException('SKU 筛选条件不正确');
+            }
+            $hasFilter = true;
+            $query->where('sku->' . $skuKey, (string)$value);
+        }
+
+        return [$query, $hasFilter];
+    }
+
+    /**
+     * @param array $raw
+     * @return array{export_num:int,export_status:int,note:?string}
+     * @throws JSONException
+     */
+    private function exportOptions(array $raw): array
+    {
+        $exportNumRaw = $raw['export_num'] ?? 0;
+        $exportNum = ($exportNumRaw === '' || $exportNumRaw === null)
+            ? 0
+            : filter_var($exportNumRaw, FILTER_VALIDATE_INT);
+        if ($exportNum === false || $exportNum < 0 || $exportNum > self::MAX_EXPORT_COUNT) {
+            throw new JSONException('单次最多导出 ' . self::MAX_EXPORT_COUNT . ' 张卡密');
+        }
+        $exportStatus = filter_var($raw['export_status'] ?? 0, FILTER_VALIDATE_INT);
+        if ($exportStatus === false || !in_array($exportStatus, [0, 1, 3], true)) {
+            throw new JSONException('“导出后删除”已被移除，请使用带关联保护的独立删除操作');
+        }
+        $note = trim((string)($raw['note'] ?? ''));
+        if (mb_strlen($note) > 64) {
+            throw new JSONException('导出备注最多 64 个字符');
+        }
+        return [
+            'export_num' => (int)$exportNum,
+            'export_status' => (int)$exportStatus,
+            'note' => $note === '' ? null : $note,
+        ];
+    }
 
     /**
      * @return array
@@ -36,8 +242,13 @@ class Card extends Manage
         $get = new Get(\App\Model\Card::class);
         $get->setPaginate((int)$this->request->post("page"), (int)$this->request->post("limit"));
         $get->setWhere($map);
-        $data = $this->query->get($get, function (Builder $builder) {
-            return $builder->with([
+        Schema::ensureCardFileTable();
+        $withFile = Schema::tableExists('card_file');
+        if ($withFile) {
+            \App\Util\CardFile\Purge::collect();
+        }
+        $data = $this->query->get($get, function (Builder $builder) use ($withFile) {
+            $relations = [
                 'owner' => function (Relation $relation) {
                     $relation->select(["id", "username", "avatar"]);
                 },
@@ -47,8 +258,32 @@ class Card extends Manage
                 'order' => function (Relation $relation) {
                     $relation->select(["id", "trade_no"]);
                 }
-            ]);
+            ];
+            if ($withFile) {
+                $relations['file'] = function (Relation $relation) {
+                    $relation->select(["id", "card_id", "name", "size", "downloads", "order_id"]);
+                };
+            }
+            return $builder->with($relations);
         });
+
+        if (is_array($data) && is_array($data['list'] ?? null)) {
+            // The preview download is owner-only; without an id the list shows no download link.
+            $canDownload = (int)($this->getManage()?->type ?? -1) === 0;
+            foreach ($data['list'] as $index => $row) {
+                if (!is_array($row)) {
+                    continue;
+                }
+                $file = $row['file'] ?? null;
+                $data['list'][$index]['file'] = is_array($file) ? [
+                    'id' => $canDownload ? (int)$file['id'] : 0,
+                    'name' => (string)$file['name'],
+                    'size' => (int)$file['size'],
+                    'downloads' => (int)$file['downloads'],
+                    'order_id' => $file['order_id'] === null ? null : (int)$file['order_id'],
+                ] : null;
+            }
+        }
 
         return $this->json(data: $data);
     }
@@ -70,6 +305,25 @@ class Card extends Manage
         return $this->json(data: $config);
     }
 
+    /**
+     * 按 类别/SKU 组合统计卡密库存(未售/锁定/已售)
+     * @param int $commodityId
+     * @return array
+     * @throws JSONException
+     */
+    public function skuStock(int $commodityId): array
+    {
+        $commodity = \App\Model\Commodity::query()->find($commodityId);
+        if (!$commodity) {
+            throw new JSONException("商品不存在");
+        }
+
+        // Combinations of the current config only (#898), zero-stock ones included, same as the list badge (#985).
+        $list = \App\Util\SkuStock::detail($commodity);
+
+        return $this->json(data: ["name" => strip_tags((string)$commodity->name), "list" => $list]);
+    }
+
 
     /**
      * @param Request $request
@@ -82,20 +336,33 @@ class Card extends Manage
         $raceGetMode = $request->post("race_get_mode", Filter::INTEGER);
         $race = $raceGetMode == 1 ? $request->post("race_input", Filter::NORMAL) : $request->post("race", Filter::NORMAL);
         $sku = $request->post("sku", Filter::NORMAL) ?: [];
-        $cardType = $request->post("card_type", Filter::INTEGER);
+        // 0 = one secret per line, 1 = secret║draft║premium║cost per line, 2 = uploaded archives
+        $cardType = (int)$request->post("card_type", Filter::INTEGER);
 
         if ($commodityId == 0) {
             throw new JSONException('(`･ω･´)请选择商品');
         }
+        if ($cardType === 2) {
+            return $this->saveFiles((int)$commodityId, $race, $sku);
+        }
+        if ($cardType !== 0 && $cardType !== 1) {
+            throw new JSONException('(`･ω･´)卡密类型不正确');
+        }
 
-        $cards = trim(trim((string)$request->post("secret", Filter::NORMAL)), PHP_EOL);
+        $rawCards = $request->unsafePost("secret");
+        if (!is_string($rawCards)) {
+            throw new JSONException('(`･ω･´)卡密信息格式不正确');
+        }
+        // PHP has already URL-decoded form fields once. Keep literal strings
+        // such as "%0A" intact instead of decoding them into extra card rows.
+        $cards = trim((string)Firewall::instance()->xssKillerLiteral($rawCards));
 
         //进行批量插入
         if ($cards == '') {
             throw new JSONException('(`･ω･´)请至少添加1条卡密信息哦');
         }
 
-        $cards = explode(PHP_EOL, $cards);
+        $cards = preg_split('/\r\n|\n|\r/', $cards) ?: [];
         $count = count($cards);
 
         $success = 0;
@@ -113,9 +380,9 @@ class Card extends Manage
 
             $cardObj = new \App\Model\Card();
 
-            if ($cardType == 0) {
+            if ($cardType === 0) {
                 $cardObj->secret = $cardt;
-            } else {
+            } elseif ($cardType === 1) {
                 //分割
                 $list = explode("║", $cardt);
                 if (count($list) < 2) {
@@ -171,8 +438,189 @@ class Card extends Manage
         }
 
 
+        if ($success > 0) {
+            $ebIds = [$commodityId];
+            $ebReason = 'import';
+            hook(\App\Consts\Hook::CARD_CHANGE_AFTER, $ebIds, $ebReason);
+        }
         ManageLog::log($this->getManage(), "[导入卡密]共计导入:{$count}张卡密，成功:{$success}张，失败：{$error}张");
         return $this->json(200, "共计导入:{$count}张卡密，成功:{$success}张，失败：{$error}张");
+    }
+
+    /**
+     * card_type 2: one card per staged archive (see Admin\Api\CardFile). With "unique", an archive
+     * whose content is already stocked, or repeated within the batch, is skipped and deleted.
+     *
+     * @throws JSONException
+     */
+    private function saveFiles(int $commodityId, mixed $race, mixed $sku): array
+    {
+        $fileIds = $this->fileIds($_POST['files'] ?? []);
+        if ($fileIds === []) {
+            throw new JSONException('(`･ω･´)请先上传压缩包');
+        }
+        if (!\App\Model\Commodity::query()->whereKey($commodityId)->exists()) {
+            throw new JSONException('(`･ω･´)商品不存在');
+        }
+        Schema::ensureCardFileTable();
+
+        $unique = (bool)($_POST['unique'] ?? false);
+        $note = $_POST['note'] ?? null;
+        if ($note !== null && (!is_string($note) || mb_strlen($note) > 64)) {
+            throw new JSONException('备注最多 64 个字符');
+        }
+        $date = Date::current();
+
+        [$success, $error, $duplicates] = DB::transaction(function () use ($fileIds, $unique, $note, $date, $commodityId, $race, $sku): array {
+            $files = \App\Model\CardFile::query()
+                ->whereIn('id', $fileIds)
+                ->where('owner', 0)
+                ->whereNull('card_id')
+                ->whereNull('order_id')
+                ->lockForUpdate()
+                ->get()
+                ->keyBy('id');
+
+            $success = 0;
+            $error = 0;
+            $duplicates = [];
+            $seen = [];
+            foreach ($fileIds as $fileId) {
+                $file = $files->get($fileId);
+                if (!$file) {
+                    $error++; //already stocked, discarded or expired
+                    continue;
+                }
+                $hash = (string)$file->hash;
+                if ($unique && (isset($seen[$hash]) || self::fileHashStocked($hash))) {
+                    $duplicates[] = $fileId;
+                    $error++;
+                    continue;
+                }
+
+                try {
+                    DB::transaction(function () use ($file, $note, $date, $commodityId, $race, $sku): void {
+                        $cardObj = new \App\Model\Card();
+                        $cardObj->secret = mb_substr((string)$file->name, 0, 760);
+                        $cardObj->commodity_id = $commodityId;
+                        $cardObj->owner = 0;
+                        if ($note !== null) {
+                            $cardObj->note = $note;
+                        }
+                        $cardObj->status = 0;
+                        $cardObj->sku = $sku;
+                        $cardObj->create_time = $date;
+                        if ($race) {
+                            $cardObj->race = $race;
+                        }
+                        $cardObj->save();
+                        $cardId = (int)$cardObj->id;
+
+                        // A recycled card id must never inherit an archive of a deleted card.
+                        \App\Model\CardFile::query()->where('card_id', $cardId)->update(['card_id' => null]);
+                        $bound = \App\Model\CardFile::query()
+                            ->whereKey($file->id)
+                            ->whereNull('card_id')
+                            ->whereNull('order_id')
+                            ->update(['card_id' => $cardId]);
+                        if ($bound !== 1) {
+                            throw new \RuntimeException('archive is no longer staged');
+                        }
+                    });
+                    $seen[$hash] = true;
+                    $success++;
+                } catch (\Throwable $e) {
+                    $error++;
+                }
+            }
+            return [$success, $error, $duplicates];
+        });
+
+        if ($duplicates !== []) {
+            Purge::staged($duplicates);
+        }
+        if ($success > 0) {
+            $ebIds = [$commodityId];
+            $ebReason = 'import';
+            hook(\App\Consts\Hook::CARD_CHANGE_AFTER, $ebIds, $ebReason);
+        }
+        $count = count($fileIds);
+        ManageLog::log($this->getManage(), "[导入文件卡密]共计导入:{$count}张卡密，成功:{$success}张，失败：{$error}张");
+        return $this->json(200, "共计导入:{$count}张卡密，成功:{$success}张，失败：{$error}张", [
+            'count' => $count,
+            'success' => $success,
+            'error' => $error,
+            'duplicate' => count($duplicates),
+        ]);
+    }
+
+    /**
+     * @param mixed $value array or comma separated card_file ids
+     * @return int[]
+     * @throws JSONException
+     */
+    private function fileIds(mixed $value): array
+    {
+        if (is_string($value)) {
+            $value = trim($value) === '' ? [] : explode(',', $value);
+        }
+        if (!is_array($value)) {
+            $value = [$value];
+        }
+
+        $ids = [];
+        foreach ($value as $candidate) {
+            if (is_int($candidate)) {
+                $id = $candidate;
+            } elseif (is_string($candidate) && preg_match('/^\d{1,10}$/D', trim($candidate))) {
+                $id = (int)trim($candidate);
+            } else {
+                throw new JSONException('文件 ID 必须是正整数');
+            }
+            if ($id <= 0) {
+                throw new JSONException('文件 ID 必须是正整数');
+            }
+            $ids[$id] = $id;
+        }
+        if (count($ids) > self::MAX_BATCH_COUNT) {
+            throw new JSONException('单次最多导入 ' . self::MAX_BATCH_COUNT . ' 个压缩包');
+        }
+        return array_values($ids);
+    }
+
+    /** Whether an archive with this content already backs a system card. */
+    private static function fileHashStocked(string $hash): bool
+    {
+        return \App\Model\CardFile::query()
+            ->where('owner', 0)
+            ->where('hash', $hash)
+            ->whereNotNull('card_id')
+            ->whereHas('card', static function (Builder $query): void {
+                $query->where('owner', 0);
+            })
+            ->exists();
+    }
+
+    private static function cardHasFile(int $cardId): bool
+    {
+        return Schema::tableExists('card_file')
+            && \App\Model\CardFile::query()->where('card_id', $cardId)->exists();
+    }
+
+    /**
+     * The edit form posts every field back; an untouched secret of a file card is not a change.
+     * $_POST went through the WAF (HTML-escaped), the raw body did not: accept either form.
+     */
+    private function secretUnchanged(string $current): bool
+    {
+        $current = trim($current);
+        $escaped = htmlspecialchars($current, ENT_QUOTES, 'UTF-8');
+        foreach ([$this->request->unsafePost('secret'), $_POST['secret'] ?? null] as $value) {
+            if (is_string($value) && in_array(trim($value), [$current, $escaped], true)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -181,13 +629,63 @@ class Card extends Manage
      */
     public function edit(): array
     {
-        $map = $_POST;
-        $save = new Save(\App\Model\Card::class);
-        $save->setMap($map);
-        $save = $this->query->save($save);
-        if (!$save) {
-            throw new JSONException("保存失败");
+        $id = (int)($_POST['id'] ?? 0);
+        if ($id <= 0) {
+            throw new JSONException('卡密不存在');
         }
+        $card = \App\Model\Card::query()->find($id);
+        if (!$card) {
+            throw new JSONException('卡密不存在');
+        }
+
+        $allowed = ['secret', 'draft', 'draft_premium', 'cost', 'note'];
+        $map = array_intersect_key($_POST, array_flip($allowed));
+        if ($map === []) {
+            throw new JSONException('没有可保存的卡密字段');
+        }
+        if (array_key_exists('secret', $map) && self::cardHasFile($id)) {
+            if (!$this->secretUnchanged((string)$card->secret)) {
+                throw new JSONException('文件卡密的内容是压缩包，不能直接修改；如需更换请删除后重新上传');
+            }
+            unset($map['secret']);
+        }
+        if (array_key_exists('secret', $map)) {
+            $secret = trim((string)$map['secret']);
+            if ($secret === '' || mb_strlen($secret) > 760) {
+                throw new JSONException('卡密信息不能为空且最多 760 个字符');
+            }
+            $map['secret'] = $secret;
+        }
+        if (array_key_exists('draft', $map) && mb_strlen((string)$map['draft']) > 255) {
+            throw new JSONException('预告内容最多 255 个字符');
+        }
+        if (array_key_exists('note', $map) && mb_strlen((string)$map['note']) > 64) {
+            throw new JSONException('备注最多 64 个字符');
+        }
+        foreach (['draft_premium', 'cost'] as $moneyField) {
+            if (!array_key_exists($moneyField, $map)) {
+                continue;
+            }
+            if ($map[$moneyField] === '') {
+                $map[$moneyField] = 0;
+                continue;
+            }
+            $value = filter_var($map[$moneyField], FILTER_VALIDATE_FLOAT);
+            if ($value === false || !is_finite((float)$value) || (float)$value < 0 || (float)$value > 99999999.99) {
+                throw new JSONException('卡密加价和成本必须是有效的非负金额');
+            }
+            $map[$moneyField] = (float)$value;
+        }
+
+        foreach ($map as $field => $value) {
+            $card->$field = $value;
+        }
+        if (!$card->save()) {
+            throw new JSONException('保存失败');
+        }
+        $ebIds = [(int)$card->commodity_id];
+        $ebReason = 'edit';
+        hook(\App\Consts\Hook::CARD_CHANGE_AFTER, $ebIds, $ebReason);
         ManageLog::log($this->getManage(), "[修改卡密]编辑了卡密信息");
         return $this->json(200, '（＾∀＾）保存成功');
     }
@@ -197,11 +695,18 @@ class Card extends Manage
      */
     public function lock(): array
     {
-        $list = (array)$_POST['list'];
-        \App\Model\Card::query()->whereIn('id', $list)->whereRaw("status!=1")->update(['status' => 2]);
-
-        ManageLog::log($this->getManage(), "[锁定卡密]批量锁定了卡密信息，共计：" . count($list));
-        return $this->json(200, '锁定成功');
+        $list = $this->cardIds($_POST['list'] ?? []);
+        if ($list === []) {
+            throw new JSONException('请至少选择一张卡密');
+        }
+        $count = \App\Model\Card::query()->whereIn('id', $list)->where('status', 0)->update(['status' => 2]);
+        if ($count > 0) {
+            $ebIds = self::commodityIdsOfCards($list);
+            $ebReason = 'lock';
+            hook(\App\Consts\Hook::CARD_CHANGE_AFTER, $ebIds, $ebReason);
+        }
+        ManageLog::log($this->getManage(), "[锁定卡密]批量锁定卡密，共计：{$count}");
+        return $this->json(200, $count > 0 ? '锁定成功' : '没有可锁定的卡密', ['count' => $count]);
     }
 
     /**
@@ -209,10 +714,18 @@ class Card extends Manage
      */
     public function unlock(): array
     {
-        $list = (array)$_POST['list'];
-        \App\Model\Card::query()->whereIn('id', $list)->whereRaw("status!=1")->update(['status' => 0]);
-        ManageLog::log($this->getManage(), "[解锁卡密]批量解锁了卡密信息，共计：" . count($list));
-        return $this->json(200, '解锁成功');
+        $list = $this->cardIds($_POST['list'] ?? []);
+        if ($list === []) {
+            throw new JSONException('请至少选择一张卡密');
+        }
+        $count = \App\Model\Card::query()->whereIn('id', $list)->where('status', 2)->update(['status' => 0]);
+        if ($count > 0) {
+            $ebIds = self::commodityIdsOfCards($list);
+            $ebReason = 'unlock';
+            hook(\App\Consts\Hook::CARD_CHANGE_AFTER, $ebIds, $ebReason);
+        }
+        ManageLog::log($this->getManage(), "[解锁卡密]批量解锁卡密，共计：{$count}");
+        return $this->json(200, $count > 0 ? '解锁成功' : '没有可解锁的卡密', ['count' => $count]);
     }
 
     /**
@@ -220,10 +733,58 @@ class Card extends Manage
      */
     public function sell(): array
     {
-        $list = (array)$_POST['list'];
-        \App\Model\Card::query()->whereIn('id', $list)->whereRaw("status!=1")->update(['status' => 1, 'purchase_time' => Date::current()]);
-        ManageLog::log($this->getManage(), "[出售卡密]手动出售卡密信息，共计：" . count($list));
-        return $this->json(200, '操作成功');
+        $list = $this->cardIds($_POST['list'] ?? []);
+        if ($list === []) {
+            throw new JSONException('请至少选择一张卡密');
+        }
+        $count = DB::transaction(function () use ($list): int {
+            $cards = \App\Model\Card::query()
+                ->whereIn('id', $list)
+                ->lockForUpdate()
+                ->get(['id', 'status', 'order_id']);
+            if ($cards->count() !== count($list)) {
+                throw new JSONException('部分卡密不存在，请刷新后重试');
+            }
+            $invalid = $cards->filter(static fn($card): bool => (int)$card->status !== 0 || (int)$card->order_id > 0)->count();
+            if ($invalid > 0) {
+                throw new JSONException('只能标记“未出售”卡密；锁定卡密请先显式解锁');
+            }
+            return \App\Model\Card::query()->whereIn('id', $list)->where('status', 0)->update([
+                'status' => 1,
+                'purchase_time' => Date::current(),
+            ]);
+        });
+        if ($count > 0) {
+            $ebIds = self::commodityIdsOfCards($list);
+            $ebReason = 'sell';
+            hook(\App\Consts\Hook::CARD_CHANGE_AFTER, $ebIds, $ebReason);
+        }
+        ManageLog::log($this->getManage(), "[出售卡密]手动标记已出售，共计：{$count}");
+        return $this->json(200, '操作成功', ['count' => $count]);
+    }
+
+    /**
+     * 卡密 id -> 受影响的商品 id（去重）。
+     *
+     * 供 CARD_CHANGE_AFTER 钩子取参用：订阅方关心的是哪个商品的库存动了，
+     * 卡密 id 对它没有意义。删除路径必须在事务之前调用，否则行已经没了。
+     *
+     * @param int[] $cardIds
+     * @return int[]
+     */
+    private static function commodityIdsOfCards(array $cardIds): array
+    {
+        if ($cardIds === []) {
+            return [];
+        }
+        return \App\Model\Card::query()
+            ->whereIn('id', $cardIds)
+            ->distinct()
+            ->pluck('commodity_id')
+            ->map(static fn($id): int => (int)$id)
+            ->filter(static fn(int $id): bool => $id > 0)
+            ->values()
+            ->all();
     }
 
     /**
@@ -232,74 +793,197 @@ class Card extends Manage
      */
     public function del(): array
     {
-        $del = new Delete(\App\Model\Card::class, $_POST['list']);
-        $count = $this->query->delete($del);
-        if ($count == 0) {
-            throw new JSONException("没有移除任何数据");
-        }
+        $requestedIds = $this->cardIds($_POST['list'] ?? []);
+        //卡密行在事务里就没了，受影响的商品 id 必须提前取
+        $affectedCommodityIds = self::commodityIdsOfCards($requestedIds);
+        $impact = DB::transaction(function () use ($requestedIds): array {
+            $impact = $this->cardDeleteImpact($requestedIds, true);
+            if (count($requestedIds) === 1 && $impact['blocked_count'] > 0) {
+                throw new JSONException(
+                    '该卡密仍被未支付订单预选占用，暂不能删除；请先处理对应订单。'
+                );
+            }
 
-        ManageLog::log($this->getManage(), "[批量删除]批量删除了卡密，共计：" . count($_POST['list']));
-        return $this->json(200, '（＾∀＾）移除成功');
+            $deletableIds = $impact['deletable_ids'];
+            $detachedOrderReferences = 0;
+            $deleted = 0;
+            if ($deletableIds !== []) {
+                // 已支付订单已经把发货内容保存到 order.secret；这里只解除
+                // 预选卡密引用，避免删除卡密后留下悬空编号。
+                $detachedOrderReferences = \App\Model\Order::query()
+                    ->whereIn('card_id', $deletableIds)
+                    ->where('status', 1)
+                    ->update(['card_id' => null]);
+                $deleted = \App\Model\Card::query()->whereIn('id', $deletableIds)->delete();
+                if ($deleted !== count($deletableIds)) {
+                    throw new JSONException('卡密删除数量异常，操作已回滚，请刷新后重试');
+                }
+            }
+            $impact['deleted_count'] = $deleted;
+            $impact['detached_order_reference_count'] = $detachedOrderReferences;
+            return $impact;
+        });
+
+        $deletedCount = $impact['deleted_count'];
+        if ($deletedCount > 0) {
+            // File cards: unsold archives go with their cards, delivered ones stay downloadable.
+            Purge::forCards($impact['deletable_ids']);
+        }
+        if ($deletedCount > 0 && $affectedCommodityIds !== []) {
+            $ebReason = 'delete';
+            hook(\App\Consts\Hook::CARD_CHANGE_AFTER, $affectedCommodityIds, $ebReason);
+        }
+        $skippedCount = $impact['blocked_count'];
+        $operation = count($requestedIds) > 1 ? '批量删除' : '删除';
+        ManageLog::log(
+            $this->getManage(),
+            "[{$operation}]卡密，成功：{$deletedCount}，跳过未支付订单占用：{$skippedCount}，解除已支付订单引用：{$impact['detached_order_reference_count']}"
+        );
+        $message = $skippedCount > 0
+            ? "删除完成：成功 {$deletedCount} 张，跳过 {$skippedCount} 张未支付订单占用卡密"
+            : '卡密删除成功';
+        return $this->json(200, $message, [
+            'count' => $deletedCount,
+            'deleted_count' => $deletedCount,
+            'skipped_count' => $skippedCount,
+            'detached_order_reference_count' => $impact['detached_order_reference_count'],
+        ]);
+    }
+
+    /**
+     * Read-only impact preview used before card deletion.
+     * @return array
+     * @throws JSONException
+     */
+    public function deleteImpact(): array
+    {
+        $impact = $this->cardDeleteImpact($this->cardIds($_POST['list'] ?? []));
+        unset($impact['card_ids'], $impact['deletable_ids']);
+        return $this->json(data: $impact);
     }
 
 
     /**
-     * 导出
+     * Read-only preview for the sensitive card export operation.
+     * @return array
+     * @throws JSONException
+     */
+    public function exportImpact(): array
+    {
+        if (strtoupper($this->request->method()) !== 'POST') {
+            throw new JSONException('卡密导出预览只接受 POST 请求');
+        }
+        $raw = $this->request->post();
+        $options = $this->exportOptions($raw);
+        [$query, $hasFilter] = $this->cardExportQuery($raw);
+        $total = (int)(clone $query)->count();
+        if ($total === 0) {
+            throw new JSONException('当前筛选没有可导出的卡密');
+        }
+        $count = $options['export_num'] > 0 ? min($options['export_num'], $total) : $total;
+        if ($count > self::MAX_EXPORT_COUNT) {
+            throw new JSONException('当前范围过大，请增加筛选或填写不超过 ' . self::MAX_EXPORT_COUNT . ' 的导出数量');
+        }
+
+        $rows = (clone $query)
+            ->orderBy('id', 'asc')
+            ->limit($count)
+            ->get(['id', 'status', 'order_id']);
+        $statusCounts = [0 => 0, 1 => 0, 2 => 0];
+        foreach ($rows as $row) {
+            $status = (int)$row->status;
+            if (array_key_exists($status, $statusCounts)) {
+                $statusCounts[$status]++;
+            }
+        }
+        if ($options['export_status'] === 3 && ($statusCounts[1] > 0 || $statusCounts[2] > 0)) {
+            throw new JSONException('标记已售仅允许导出“未出售”卡密，请先调整筛选条件');
+        }
+
+        return $this->json(data: [
+            'count' => $count,
+            'total' => $total,
+            'has_filter' => $hasFilter,
+            'available_count' => $statusCounts[0],
+            'sold_count' => $statusCounts[1],
+            'locked_count' => $statusCounts[2],
+            'will_change_note' => $options['note'] !== null,
+            'export_status' => $options['export_status'],
+            'max_count' => self::MAX_EXPORT_COUNT,
+        ]);
+    }
+
+    /**
+     * Export card secrets using POST so filters and secrets never enter URLs.
+     * Mutating follow-up modes run atomically; physical deletion is forbidden.
      * @return string
+     * @throws JSONException
      */
     public function export(): string
     {
-        $map = $_GET;
-        $exportStatus = $map['export_status'];
-        $exportNum = (int)$map['export_num'];
-        $note = $map['note'] ?: null;
-
-        unset($map['export_status']);
-        unset($map['export_num']);
-
-
-        $get = new Get(\App\Model\Card::class);
-        $get->setWhere($map);
-
-        if ($exportNum > 0) {
-            $get->setPaginate(1, $exportNum);
-            $data = $this->query->get($get);
-        } else {
-            $data = $this->query->get($get);
+        if (strtoupper($this->request->method()) !== 'POST') {
+            throw new JSONException('卡密导出只接受 POST 请求');
+        }
+        $raw = $this->request->post();
+        $options = $this->exportOptions($raw);
+        [$query] = $this->cardExportQuery($raw);
+        $total = (int)(clone $query)->count();
+        if ($total === 0) {
+            throw new JSONException('当前筛选没有可导出的卡密');
+        }
+        $count = $options['export_num'] > 0 ? min($options['export_num'], $total) : $total;
+        if ($count > self::MAX_EXPORT_COUNT) {
+            throw new JSONException('当前范围过大，请增加筛选或填写不超过 ' . self::MAX_EXPORT_COUNT . ' 的导出数量');
         }
 
-        $card = '';
-        $ids = [];
-        foreach ($data['list'] as $d) {
-            $card .= $d['secret'] . PHP_EOL;
-            $ids[] = $d['id'];
-        }
-
-        if ($note) {
-            \App\Model\Card::query()->whereIn('id', $ids)->update(['note' => $note]);
-        }
-
-        if ($exportStatus == 1) {
-            //锁定卡密
-            try {
-                \App\Model\Card::query()->whereIn('id', $ids)->whereRaw("status!=1")->update(['status' => 2]);
-            } catch (\Exception $e) {
+        $result = DB::transaction(function () use ($raw, $options, $count): array {
+            // Rebuild inside the transaction so the same validated scope is
+            // locked immediately before any optional status/note update.
+            [$lockedQuery] = $this->cardExportQuery($raw);
+            $rows = $lockedQuery
+                ->orderBy('id', 'asc')
+                ->limit($count)
+                ->lockForUpdate()
+                ->get(['id', 'secret', 'status', 'order_id']);
+            if ($rows->count() !== $count) {
+                throw new JSONException('卡密数据已变化，请重新预览导出范围');
             }
-        } elseif ($exportStatus == 2) {
-            //删除卡密
-            try {
-                $deleteBatchEntity = new Delete(\App\Model\Card::class, $ids);
-                $this->query->delete($deleteBatchEntity);
-            } catch (\Exception $e) {
-            }
-        } elseif ($exportStatus == 3) {
-            \App\Model\Card::query()->whereIn('id', $ids)->whereRaw("status!=1")->update(['status' => 1, 'purchase_time' => Date::current()]);
-        }
 
-        ManageLog::log($this->getManage(), "[卡密导出]导出卡密，共计：" . count($data));
+            $ids = $rows->pluck('id')->map(static fn($id): int => (int)$id)->all();
+            if ($options['export_status'] === 3) {
+                $invalid = $rows->filter(static fn($row): bool => (int)$row->status !== 0 || (int)$row->order_id > 0)->count();
+                if ($invalid > 0) {
+                    throw new JSONException('标记已售仅允许处理未出售且未关联订单的卡密');
+                }
+            }
+
+            if ($options['note'] !== null) {
+                \App\Model\Card::query()->whereIn('id', $ids)->update(['note' => $options['note']]);
+            }
+            if ($options['export_status'] === 1) {
+                \App\Model\Card::query()->whereIn('id', $ids)->where('status', 0)->update(['status' => 2]);
+            } elseif ($options['export_status'] === 3) {
+                \App\Model\Card::query()->whereIn('id', $ids)->where('status', 0)->update([
+                    'status' => 1,
+                    'purchase_time' => Date::current(),
+                ]);
+            }
+
+            return [
+                'content' => $rows->pluck('secret')->implode(PHP_EOL) . PHP_EOL,
+                'count' => $rows->count(),
+            ];
+        });
+
+        $effect = match ($options['export_status']) {
+            1 => '并锁定未出售卡密',
+            3 => '并标记卡密已售',
+            default => '仅下载',
+        };
+        ManageLog::log($this->getManage(), "[卡密导出]{$effect}，共计：{$result['count']}");
         header('Content-Type:application/octet-stream');
         header('Content-Transfer-Encoding:binary');
-        header('Content-Disposition:attachment; filename=卡密导出(' . count($data) . ')-' . Date::current() . '.txt');
-        return $card;
+        header('Content-Disposition:attachment; filename=cards-' . $result['count'] . '-' . date('Ymd-His') . '.txt');
+        return $result['content'];
     }
 }

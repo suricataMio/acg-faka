@@ -5,12 +5,11 @@ namespace App\Interceptor;
 
 
 use App\Consts\Manage as ManageConst;
-use App\Model\Manage;
+use App\Service\ManageSessionManager;
+use App\Util\AdminLock;
 use App\Util\Client;
 use App\Util\Context;
 use App\Util\Date;
-use App\Util\JWT;
-use Firebase\JWT\Key;
 use JetBrains\PhpStorm\NoReturn;
 use Kernel\Annotation\Interceptor;
 use Kernel\Annotation\InterceptorInterface;
@@ -44,40 +43,13 @@ class ManageSession implements InterceptorInterface
         }
 
 
-        $manageToken = base64_decode((string)$_COOKIE[ManageConst::SESSION]);
-
-
-        if (empty($manageToken)) {
+        $resolved = ManageSessionManager::authenticate((string)$_COOKIE[ManageConst::SESSION]);
+        if (!$resolved) {
             $this->kick($type);
         }
 
-        $head = JWT::getHead($manageToken);
-
-
-        if (!isset($head['mid'])) {
-            $this->kick($type);
-        }
-
-        $manage = Manage::query()->find($head['mid']);
-
-        if (!$manage) {
-            $this->kick($type);
-        }
-
-        try {
-            $jwt = \Firebase\JWT\JWT::decode($manageToken, new Key($manage->password, 'HS256'));
-        } catch (\Exception $e) {
-            $this->kick($type);
-        }
-
-        if (
-            $jwt->expire <= time() ||
-            $manage->login_time != $jwt->loginTime ||
-            $manage->login_ip != Client::getAddress() ||
-            $manage->status != 1
-        ) {
-            $this->kick($type);
-        }
+        $manage = $resolved['manage'];
+        $session = $resolved['session'];
 
         if (!file_exists(BASE_PATH . "/config/terms")) {
             if (\Kernel\Util\Context::get(Base::ROUTE) == "/admin/dashboard/index" && $_GET['agree'] == 1) {
@@ -90,12 +62,28 @@ class ManageSession implements InterceptorInterface
 
         //保存会话
         Context::set(ManageConst::SESSION, $manage);
+        Context::set(ManageConst::SESSION_RECORD, $session);
+
+        //闲置锁屏（伺服器强制）：逾时后 API 回 42010、VIEW 转锁屏页。
+        //解锁/ping 端点在不受本拦截器守卫的 Authentication 控制器，故锁定时仍可访问。
+        if (AdminLock::isLocked($session)) {
+            $this->locked($type);
+        }
+    }
+
+    #[NoReturn] private function locked(int $type): void
+    {
+        if ($type == Interceptor::TYPE_VIEW) {
+            Client::redirect("/admin/authentication/lock?goto=" . urlencode((string)$_SERVER['REQUEST_URI']), "", 0);
+        }
+        header('content-type:application/json;charset=utf-8');
+        exit(json_encode(["code" => 42010, "msg" => "会话已锁定，请重新验证解锁"], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
     }
 
 
     #[NoReturn] private function kick(int $type): void
     {
-        setcookie(ManageConst::SESSION, "", time() - 3600, "/");
+        ManageSessionManager::clearCookie();
         if ($type == Interceptor::TYPE_VIEW) {
             Client::redirect("/admin/authentication/login?goto=" . urlencode($_SERVER['REQUEST_URI']), "登录会话过期，请重新登录..");
         } else {
