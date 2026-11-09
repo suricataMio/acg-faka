@@ -754,12 +754,20 @@
     try {
         var saved = JSON.parse(sessionStorage.getItem('acg-install-state') || 'null');
         if (saved && saved.form) {
-            Object.keys(state.form).forEach(function (k) { if (typeof saved.form[k] === 'string') state.form[k] = saved.form[k]; });
+            // Restore only non-secret fields. Older versions stored passwords in sessionStorage;
+            // never read those values back into the form.
+            ['host', 'port', 'database', 'username', 'prefix', 'email', 'nickname'].forEach(function (k) {
+                if (typeof saved.form[k] === 'string') state.form[k] = saved.form[k];
+            });
             if (typeof saved.step === 'number' && saved.step > 0 && saved.step < 3 && env.install) state.step = saved.step;
         }
     } catch (e) {}
     function persist() {
-        try { sessionStorage.setItem('acg-install-state', JSON.stringify({step: state.step, form: state.form})); } catch (e) {}
+        try {
+            var form = {};
+            ['host', 'port', 'database', 'username', 'prefix', 'email', 'nickname'].forEach(function (k) { form[k] = state.form[k]; });
+            sessionStorage.setItem('acg-install-state', JSON.stringify({step: state.step, form: form}));
+        } catch (e) {}
     }
     function dbFingerprint() {
         var f = state.form;
